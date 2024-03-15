@@ -1,2 +1,8 @@
 .DS_Store
 .vscode
+mr-out*
+mr-tmp
+mrmaster
+mrsequential
+mrworker
+

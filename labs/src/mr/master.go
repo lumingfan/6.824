@@ -42,11 +42,11 @@ func (m *Master) server() {
 }
 
 //
-// main/mrmaster.go calls Done() periodically to find out
+// masrc/mrmaster.go calls Done() periodically to find out
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
+	ret := true
 
 	// Your code here.
 
@@ -56,7 +56,7 @@ func (m *Master) Done() bool {
 
 //
 // create a Master.
-// main/mrmaster.go calls this function.
+// masrc/mrmaster.go calls this function.
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
