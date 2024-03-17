@@ -19,7 +19,10 @@ const (
 type TasksInfo struct {
 	unfinished_tasks_ map[int]bool	
 
-	// if true, then this worker doesn't crash
+	// channel is used by timer
+	// if no reply in 10 secs, timer will fire, 
+	// 	then give up this worker
+	// stop timer when receive a reply in 10 secs
 	inprocess_tasks_ map[int]chan bool
 	idle_tasks_ map[int]bool
 }
@@ -45,21 +48,20 @@ func (t *TasksInfo) allocateTask() int {
 	panic("NoAvailableTasks must be checked before calling this function")
 }
 
+// finish a task
 func (t *TasksInfo) finishTask(task_id int)  {
 	delete(t.inprocess_tasks_, task_id)
 	delete(t.unfinished_tasks_, task_id)
 }
 
+// change the task state from in-process to idle
+// used by fail tolerance
 func (t *TasksInfo) releaseTask(task_id int) {
 	t.idle_tasks_[task_id] = true
 	delete(t.inprocess_tasks_, task_id)
 }
 
-func (t *TasksInfo) existTaskInprocess(task_id int) bool {
-	_, ok := t.inprocess_tasks_[task_id]
-	return ok
-}
-
+// Get crash channel, used by file tolerance
 func (t *TasksInfo) GetWorkerCrashChannel(task_id int) (chan bool, bool) {
 	ch, ok := t.inprocess_tasks_[task_id]
 	return ch, ok
@@ -77,6 +79,7 @@ type ReduceTasksInfo struct {
 	tasks_ *TasksInfo
 }
 
+// return a TasksInfo
 func MakeTasksInfo(ntasks int) *TasksInfo {
 	tasks := TasksInfo{
 		unfinished_tasks_: map[int]bool{},
@@ -109,55 +112,65 @@ func MakeReduceTasksInfo(nreduce int) *ReduceTasksInfo {
 
 type Master struct {
 	// Your definitions here.
+	// M map tasks
 	map_tasks_info_ *MapTasksInfo
 		
 	// N reduce tasks
 	reduce_tasks_info_ *ReduceTasksInfo
 
+	// is this job done
 	done_ bool;
 
+	// used to protect internal data 
 	mutex_ sync.Mutex;
-	reduce_Cond_ *sync.Cond;
+
+	// used to block/wake idle workers
 	idle_workers_Cond_  *sync.Cond;
 }
 
 
 // helper for RPC handler
+
+// wrapper
 func (m *Master) AllocateMapTask() int {
 	return m.map_tasks_info_.tasks_.allocateTask()
 }
-
 func (m *Master) AllocateReduceTask() int {
 	return m.reduce_tasks_info_.tasks_.allocateTask()
 }
-
 func (m *Master) GetMapFileName(map_task_id int) string {
 	return m.map_tasks_info_.filenames_[map_task_id]	
 }
 
 // release a inprocess task, then wake idle workers
-func (m* Master) MigrateTask(task_type WorkerType, task_id int) {
+// used by fail tolerance
+func (m* Master) ReIssueTask(task_type WorkerType, task_id int) {
 	m.mutex_.Lock()
 	if task_type == MapType {
 		m.map_tasks_info_.tasks_.releaseTask(task_id)
 	} else {
 		m.reduce_tasks_info_.tasks_.releaseTask(task_id)
 	}
-	m.reduce_Cond_.Broadcast()
 	m.idle_workers_Cond_.Broadcast()
 	m.mutex_.Unlock()
 }
 
-func (m* Master) TimerStart(task_type WorkerType, task_id int) {
-	var crash_channel chan bool
-	var ok bool
-	m.mutex_.Lock()
+// get a channel used by fail tolerance
+func (m *Master) GetCrashChannel(task_type WorkerType, task_id int) (chan bool, bool){
 	if task_type == MapType {
-		crash_channel, ok = m.map_tasks_info_.tasks_.GetWorkerCrashChannel(task_id)
-		
+		return m.map_tasks_info_.tasks_.GetWorkerCrashChannel(task_id)
 	} else {
-		crash_channel, ok = m.reduce_tasks_info_.tasks_.GetWorkerCrashChannel(task_id)
+		return m.reduce_tasks_info_.tasks_.GetWorkerCrashChannel(task_id)
 	}
+}
+
+// start a timer, if worker doesn't reply in 10 secs
+// re-issue the task to other workers
+// fail tolerance
+func (m* Master) TimerStart(task_type WorkerType, task_id int) {
+	// get crash timer
+	m.mutex_.Lock()
+	crash_channel, ok := m.GetCrashChannel(task_type, task_id)	
 	m.mutex_.Unlock()
 
 	// this task is not in process
@@ -165,17 +178,18 @@ func (m* Master) TimerStart(task_type WorkerType, task_id int) {
 		return 
 	}
 
+	// start timer
 	timer := time.NewTimer(time.Second * 10)
 	for {
 		select {
-			// process task_id finished in 10 seconds
+		// task finished in 10 seconds
 		case <- crash_channel:
 			timer.Stop()
 			return 
 		
-		// process task_id doesn't be finished in 10 secs
+		// time-out
 		case <- timer.C:
-			m.MigrateTask(task_type, task_id)
+			m.ReIssueTask(task_type, task_id)
 			return 
 		}
 	}
@@ -192,7 +206,7 @@ func (m *Master) ScheduleWork() (WorkerType, int, bool) {
 	if (m.map_tasks_info_.tasks_.noAvailableTasks()) {
 		// reduces can't start until the last map has finished
 		for !m.map_tasks_info_.tasks_.tasksFinished() {
-			m.reduce_Cond_.Wait()
+			m.idle_workers_Cond_.Wait()
 			if !m.map_tasks_info_.tasks_.noAvailableTasks() {
 				return m.ScheduleWork()
 			}
@@ -209,15 +223,13 @@ func (m *Master) ScheduleWork() (WorkerType, int, bool) {
 		return ReduceType, task_id, false
 	}
 
-	if m.map_tasks_info_.tasks_.noAvailableTasks() {
-		panic("logic error")
-	}
 	// allocate a map task to worker
 	task_id := m.AllocateMapTask()
 	return MapType, task_id, false
 }
 
 // RPC handler
+// all workers request a task by this rpc
 func (m *Master) RegisterWorker(args *RegisterWorkerArgs, reply *Reply) error {
 	m.mutex_.Lock()
 	done := m.done_
@@ -255,24 +267,28 @@ func (m *Master) RegisterWorker(args *RegisterWorkerArgs, reply *Reply) error {
 	return nil
 }
 
+// map workers call this rpc when they finish task
 func (m *Master) MapFinished(args *Args, reply *Reply) error {
 	map_worker_id := args.Worker_id
 	
-
 	m.mutex_.Lock()	
-	// stop crash timer
+	// get crash timer channel
 	ch, ok := m.map_tasks_info_.tasks_.GetWorkerCrashChannel(map_worker_id)
 	m.mutex_.Unlock()
-	// this task is no in process
+	// this task is not in process
 	if !ok {
 		return nil
 	}
+	// stop timer
 	ch <- true 
 
 	m.mutex_.Lock()
+	// this task has been finished
 	m.map_tasks_info_.tasks_.finishTask(map_worker_id)
 	if (m.map_tasks_info_.tasks_.tasksFinished()) {
-		m.reduce_Cond_.Broadcast()
+		// all map task finished, 
+		// idle workers can apply for a reduce task
+		m.idle_workers_Cond_.Broadcast()
 	}
 	m.mutex_.Unlock()
 	return nil
@@ -282,24 +298,19 @@ func (m *Master) ReduceFinished(args *Args, reply *Reply) error {
 	reduce_worker_id := args.Worker_id
 
 	m.mutex_.Lock()
-	// stop crash timer
 	ch, ok := m.reduce_tasks_info_.tasks_.GetWorkerCrashChannel(reduce_worker_id)
 	m.mutex_.Unlock()
-
-	// this task is no in process
 	if !ok {
 		return nil
 	}
-
 	ch <- true 
+
 	m.mutex_.Lock()
 
 	m.reduce_tasks_info_.tasks_.finishTask(reduce_worker_id)
-	
-	// all tasks finished, wake all waiting workers
+	// job finished, wake all waiting workers
 	if m.reduce_tasks_info_.tasks_.tasksFinished() {
 		m.done_ = true
-		m.reduce_Cond_.Broadcast()
 		m.idle_workers_Cond_.Broadcast()
 	}
 	m.mutex_.Unlock()
@@ -357,7 +368,6 @@ func MakeMaster(files []string, nReduce int) *Master {
 		mutex_:  sync.Mutex{},
 	}
 
-	m.reduce_Cond_ = sync.NewCond(&m.mutex_)
 	m.idle_workers_Cond_ = sync.NewCond(&m.mutex_)
 
 	// Your code here.
