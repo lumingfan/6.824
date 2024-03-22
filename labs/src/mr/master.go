@@ -352,7 +352,10 @@ func (m *Master) server() {
 //
 func (m *Master) Done() bool {
 	// Your code here.
-	return m.done_;
+	m.mutex_.Lock()
+	done := m.done_
+	m.mutex_.Unlock()
+	return done
 }
 
 //
