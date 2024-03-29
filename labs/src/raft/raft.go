@@ -61,13 +61,23 @@ type Raft struct {
 
 	// 2A
 
-	current_term int
-	voted_for int
-	current_state State
-	follower_election_flag  bool
-	election_timer *time.Ticker
+	current_term int 		// the current term of this server 
+	voted_for int    		// the server votes for which server (-1 for none)
+	current_state State  	// the current state of server
 
-	logs []int 
+	/** 
+	 *  default true, set to false 
+	 *  if a follower receives AppendEntries RPC from current leader or 
+	 *  grants vote to candidate before the timer expires
+	*/ 
+	follower_election_flag  bool
+	election_timer *time.Ticker  // timer for start election
+	
+	/**
+	 * store logs, for lab2a, only the term, 
+	 * initially only one element with term 0
+	*/
+	logs []int 				
 }
 
 // return currentTerm and whether this server
@@ -311,11 +321,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 const (
+	// random timeout range of election timer is [300, 600)
 	RAND_TIMEOUT_LOWER_BOUND int = 300
 	RAND_TIMEOUT_RANGE int = 300
+
+	// timeout of heartbeat timer is 100
 	HEARTBEAT_TIMEOUT int = 100
 )
 
+// used for debug
 var DEBUG_STATE = [] string {"follower", "candidate", "leader"}
 
 type State int
@@ -326,11 +340,14 @@ const (
 )
 
 
+// generate a duration between 300ms to 600ms
 func genRandDuration() time.Duration {
 	return time.Duration(rand.Intn(RAND_TIMEOUT_RANGE) + RAND_TIMEOUT_LOWER_BOUND) * time.Millisecond
 }
 
-// only called once 
+/** Start a election timer 
+ *  only called once in Make as a goroutine
+ */
 func (rf *Raft) startElectionTimer() {
 	rf.election_timer = time.NewTicker(genRandDuration()) 
 	defer rf.election_timer.Stop()
@@ -350,11 +367,16 @@ func (rf *Raft) startElectionTimer() {
 	}
 }
 
+/** Reset the election timer 
+ *  called when start a new election
+ */
 func (rf *Raft) resetElectionTimer() {
 	rf.election_timer.Reset(genRandDuration())
 }
 
-// only called once 
+/** Start heartbeats timer 
+ * 	only called once in Make as a goroutine
+ */ 
 func (rf *Raft) startHeartBeatsTimer() {
 	for {
 		time.Sleep(time.Duration(HEARTBEAT_TIMEOUT) * time.Millisecond)
@@ -368,6 +390,10 @@ func (rf *Raft) startHeartBeatsTimer() {
 }
 
 
+/** start a new election
+ * 	wait for obtaining a majority of votes or 
+ * 	receiving replies from all other servers
+ */
 func (rf *Raft) beginElection() {
 	rf.mu.Lock()
 	if rf.current_state != CANDIDATE {
@@ -440,6 +466,9 @@ func (rf *Raft) beginElection() {
 	}
 }
 
+/** start a heartbeats
+ * 	doesn't wait for replies
+ */
 func (rf *Raft) beginHeartbeats() {
 	rf.mu.Lock()
 	if rf.current_state != LEADER {
@@ -462,6 +491,10 @@ func (rf *Raft) beginHeartbeats() {
 }
 
 
+/** Check if it is necessary to update the current term and transition back to being a follower. 
+ *  Called before processing a RPC request or 
+ * 	after receiving a RPC reply  
+*/
 func (rf *Raft) checkUpdateTerm(term int) bool {
 	if term < rf.current_term {
 		return false
@@ -475,6 +508,12 @@ func (rf *Raft) checkUpdateTerm(term int) bool {
 	return true
 }
 
+/** extended checkUpdateTerm for AppendEntries RPC handler
+ * 	when the state of this server is CANDIDATE, 
+ *		it must transition back to being a follower
+ *  when the state of this server is FOLLOWER
+ * 		it must prevent next election
+*/
 func (rf *Raft) checkUpdateTermAppEntVer(term int) bool {
 	if !rf.checkUpdateTerm(term) {
 		return false
