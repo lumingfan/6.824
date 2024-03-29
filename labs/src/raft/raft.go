@@ -389,35 +389,52 @@ func (rf *Raft) beginElection() {
 
 	voted_num := 1
 	voted_mu := sync.Mutex{}
-	voted_wg := sync.WaitGroup{}
+	voted_fin_flag := false
+	voted_fin_cv := sync.Cond{
+		L: &voted_mu,
+	}
 
 	for id := 0; id < len(rf.peers); id++ {
 		if id != rf.me {
-			voted_wg.Add(1)
 			go func(server int) {
-				defer voted_wg.Done()
-
 				reply := RequestVoteReply{}
 				ok := rf.sendRequestVote(server, &args, &reply)
-
 				voted_mu.Lock()
 				defer voted_mu.Unlock()
 				
+				if voted_fin_flag {
+					return 
+				}
+
 				if ok && reply.VotedGranted {
 					voted_num++
+					if voted_num > len(rf.peers) / 2 {
+						voted_fin_flag = true	
+						voted_fin_cv.Signal()
+					}
 				} 
+				
+				// last peers'response, and didn't win this election
+				if !voted_fin_flag && server == len(rf.peers) - 1 {
+					voted_fin_flag = true
+					voted_fin_cv.Signal()
+				}
 			}(id)
 		}
 	}			
 
-	voted_wg.Wait()
-	
+	voted_mu.Lock()
+	for !voted_fin_flag {
+		voted_fin_cv.Wait()	
+	}
+	voted_mu.Unlock()
+
 	rf.mu.Lock()
 	if voted_num > len(rf.peers) / 2 && rf.current_state == CANDIDATE {
 		// become a leader 
 		rf.current_state = LEADER
 		rf.mu.Unlock()
-		go rf.beginHeartbeats()
+		rf.beginHeartbeats()
 	} else {
 		rf.mu.Unlock()
 	}
