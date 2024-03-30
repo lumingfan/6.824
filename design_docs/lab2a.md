@@ -115,19 +115,47 @@ I utilize `time.Sleep` function to implement the timer for heartbeats, because t
 
 > How do you implement the election ?
 
+`beginElection` first check the whether the current state is CANDIDATE (asynchronous RPC handler/sender may alter the state), if not, it returns immediately. Otherwise, it follows the rules for a CANDIDATE:
 
-> How do you implement the heartbeats ?
+- Increment currentTerm
+- Vote for self
+- Reset election timer
+- Send RequestVote RPCs to all other servers 
+
+Before sending RequestVote RPCs to all other servers, we must unlock the mutex, because we need to acquire the lock in `sendRequestVote` (**deadlock**).
+
+I use `sync.Cond` to allow `beginElection` to wait util a majority of servers votes for us or all servers reply to us. (In the first version, i use `sync.WaitGroup` to wait for replies from all servers, but it could block for a long time if one server is offline, causing test failures)
 
 
-### Rationale
+After being awakened by `Signal`, we check if we won this election and if the current state is still CANDIDATE (for the same reason as the initial check at the beginning of `beginElection`), if  conditions hold, we transition to the leader state and  send heartbeats to other servers. If not, we return and wait for election timer to expire.
 
-
-## Request Vote RPC
+## RPCs
 
 ### Data Structures
 
 > Copy here the declaration of each new or changed `struct` or `struct member`
 > Identify the purpose of each in 25 words or less.
+
+A `AppendEntriesArgs` is used as the arguments for `AppendEntries` RPC
+
+in this lab, we need a Term to tell other servers the current term of leader
+
+```go
+type AppendEntriesArgs struct {
+    Term int        // current term of leader
+}
+```
+
+A `AppendEntriesReply` is used as the reply for `AppendEntries` RPC
+
+In this lab, we require a Term field to reply to the leader, let it to update itself according to this Term.
+
+```go
+type AppendEntriesReply struct {
+    Term int        // current term of this server
+}
+```
+
 
 added to RequestVoteArgs struct:
 
@@ -147,50 +175,17 @@ VoteGranted bool    // means candidate received vote
 
 ### Algorithms
 
-> Briefly describe your implementation of RequestVote
+> Briefly describe your implementation of RequestVote/AppendEntriesVote RPC handler
 
-RequestVote first get its own state, if it's the candidate or leader and term > currentTerm, set term = currentTerm, return to a follower, if term <= currentTerm, return false.
+RequestVote RPC handler first calls the helper function `checkUpdateTerm` to verify if the sender's term is valid. If it's not, return false immediately. Otherwise, it checks if it needs to update its current term/state and return true. 
 
-otherwise, if it's a follower and
-
-- the voteInfo.voted is still false
-- term >= currentTerm
-- candidate’s log is at least as up-to-date as receiver’s log
-
-return true
-
-> Briefly describe your implementation of SendRequestVote
-
-SendRequestVote send a RequestVote RPC to a specify server, after RPC return, it check voteGranted, if true, then add the voted num by 1, if get the major votes, then send true to candidateCh.
-
-### Rationale
+Once `checkUpdateTerm` completes, we check if we need to vote for the sender, if the conditions are met, records the `voted_for` information and set `follower_election_flag` to false to prevent the next election.
 
 
-## Heartbeat RPC
+AppendEntries RPC handler only needs to call `checkUpdateTermAppEntVer` helper function to perform check/update tasks in this lab.
 
-### Data Structures
-> Copy here the declaration of each new or changed `struct` or `struct member`
-> Identify the purpose of each in 25 words or less.
+`checkUpdateTermAppEntVer` first call `checkUpdateTerm` to do basic check/update works, then depending on the current state, perform some additional updates:
 
-A `AppendEntriesArgs` struct is used as the args of SendAppendEntires RPC.
+- CANDIDATE: revert back to a FOLLOWER
+- FOLLOWER: set follower_election_flag to false to prevent next election
 
-```go
-type AppendEntriesArgs struct {
-    term int            // leader’s term
-    entries []Log       // log entries to store (empty for heartbeat)
-}
-```
-
-A `AppendEntriesReply` is used as the reply of AppendEntires RPC
-
-```go
-type AppendEntriesReply struct {
-    term int            // currentTerm, for leader to update itself
-}
-```
-
-### Algorithms
-
-
-
-### Ratinoale
