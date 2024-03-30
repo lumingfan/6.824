@@ -139,10 +139,11 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term int 
-	Candidate_id int
-	Last_log_idx int
-	Last_log_term int
+
+	Term int  				// candidate's term
+	Candidate_id int		// candidate requesting vote
+	Last_log_idx int		// index of candidate's last log entry
+	Last_log_term int		// term of candidate's last log entry
 }
 
 type AppendEntriesArgs struct {
@@ -156,8 +157,8 @@ type AppendEntriesArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term int
-	VotedGranted bool
+	Term int		  // currentTerm, for candidate to update itself
+	VotedGranted bool // means candidate received vote
 }
 
 type AppendEntriesReply struct {
