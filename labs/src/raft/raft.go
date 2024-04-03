@@ -269,6 +269,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commit_index = min(args.Leader_commit_index, args.Prev_log_index+len(args.Entries))
 		if rf.commit_index > rf.last_applied {
 			rf.last_applied++
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[rf.last_applied].Command,
+				CommandIndex: rf.last_applied,
+			}
+			rf.apply_ch <- msg
+			DPrintf("server %d send message: %v", rf.me, msg)
 		}
 	}
 
@@ -327,7 +334,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
-// the first return value is the inex that the command will appear at
+// the first return value is the index that the command will appear at
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
@@ -339,10 +346,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index = len(rf.logs)
-	term = rf.current_term
 	isLeader = rf.current_state == LEADER
-	rf.logs = append(rf.logs, Log{command, term})
+	if isLeader {
+		index = len(rf.logs)
+		term = rf.current_term
+		rf.logs = append(rf.logs, Log{command, term})
+		DPrintf("add term: %d, command: %v", rf.logs[index].Term, rf.logs[index].Command)
+	}
 
 	return index, term, isLeader
 }
@@ -549,6 +559,7 @@ func (rf *Raft) beginElection() {
 	rf.mu.Lock()
 	if voted_num > len(rf.peers)/2 && rf.current_state == CANDIDATE {
 		// become a leader
+		DPrintf("%d becomes a LEADER", rf.me)
 		rf.current_state = LEADER
 		for idx := range rf.next_index {
 			rf.next_index[idx] = len(rf.logs)
@@ -631,7 +642,7 @@ func (rf *Raft) beginHeartbeats() {
 
 				// success, update nextIdx and matchIdx
 				rf.mu.Lock()
-				rf.next_index[server] += len(args.Entries)
+				rf.next_index[server] = len(rf.logs)
 				rf.match_index[server] = rf.next_index[server] - 1
 				rf.mu.Unlock()
 
@@ -662,8 +673,17 @@ func (rf *Raft) beginHeartbeats() {
 	}
 	if cnt > len(rf.peers)/2 && len(rf.logs) > rf.commit_index+1 && rf.logs[rf.commit_index+1].Term == rf.current_term {
 		rf.commit_index++
+
 		if rf.commit_index > rf.last_applied {
 			rf.last_applied++
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[rf.last_applied].Command,
+				CommandIndex: rf.last_applied,
+			}
+			rf.apply_ch <- msg
+			
+			DPrintf("leader %d send message: %v", rf.me, msg)
 		}
 	}
 	rf.mu.Unlock()
