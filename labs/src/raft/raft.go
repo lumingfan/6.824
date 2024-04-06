@@ -697,8 +697,9 @@ func (rf *Raft) sendElection(args *RequestVoteArgs) {
 	for id := 0; id < len(rf.peers); id++ {
 		if id != rf.me {
 			go func(server_id int) {
-				reply := rf.sendRequestVoteRepeat(server_id, args)
-				if rf.isTermOrStateStale(args.Term, CANDIDATE) {
+				reply := RequestVoteReply{}
+				ok := rf.sendRequestVote(server_id, args, &reply)
+				if !ok || rf.isTermOrStateStale(args.Term, CANDIDATE) {
 					rf.exitSendElection(server_id, &voted_num, &voted_fin_flag, &voted_mu, &voted_fin_cv)
 				}	
 
@@ -777,28 +778,6 @@ func (rf *Raft) sendHeartbeats(args []*AppendEntriesArgs) {
 	}	
 }
 
-func (rf *Raft) sendRequestVoteRepeat(server_id int, args *RequestVoteArgs) *RequestVoteReply{
-	reply := RequestVoteReply{}
-	for !rf.sendRequestVote(server_id, args, &reply) {
-		if rf.killed() || rf.isTermOrStateStale(args.Term, CANDIDATE) {
-			break
-		}
-		reply = RequestVoteReply{}
-	}
-	return &reply
-}
-
-func (rf *Raft) sendAppendEntriesRepeat(server_id int, args *AppendEntriesArgs) *AppendEntriesReply{
-	reply := AppendEntriesReply{}
-	for !rf.sendAppendEntries(server_id, args, &reply) {
-		if rf.killed() || rf.isTermOrStateStale(args.Term, LEADER) {
-			break 
-		}
-		reply = AppendEntriesReply{}
-	}
-	return &reply
-}
-
 func (rf *Raft) isTermOrStateStale(origin_term int, origin_state State) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -806,9 +785,10 @@ func (rf *Raft) isTermOrStateStale(origin_term int, origin_state State) bool {
 }
 
 func (rf *Raft) sendSingleHeartbeats(server_id int, args *AppendEntriesArgs) {
-	reply := rf.sendAppendEntriesRepeat(server_id, args)
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server_id, args, &reply)
 
-	if rf.isTermOrStateStale(args.Term, LEADER) {
+	if !ok || rf.isTermOrStateStale(args.Term, LEADER) {
 		return 
 	}
 
@@ -826,13 +806,14 @@ func (rf *Raft) sendSingleHeartbeats(server_id int, args *AppendEntriesArgs) {
 		}
 
 		rf.mu.Lock()
-		rf.decreaseNextIndex(server_id, reply)
+		rf.decreaseNextIndex(server_id, &reply)
 		args = rf.generateAppendEntriesArgs(server_id)
 		rf.mu.Unlock()
 		
-		reply = rf.sendAppendEntriesRepeat(server_id, args)
+		reply = AppendEntriesReply{}
+		ok = rf.sendAppendEntries(server_id, args, &reply)
 
-		if rf.isTermOrStateStale(args.Term, LEADER) {
+		if !ok || rf.isTermOrStateStale(args.Term, LEADER) {
 			return
 		}
 	}
