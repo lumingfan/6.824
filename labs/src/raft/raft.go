@@ -18,8 +18,10 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sort"
+	"src/labgob"
 	"src/labrpc"
 	"sync"
 	"sync/atomic"
@@ -129,6 +131,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// caller must hold the rf.mu.Lock
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -138,6 +141,16 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+
+	encoder.Encode(rf.current_term)
+	encoder.Encode(rf.voted_for)
+	encoder.Encode(rf.logs)
+	data := buffer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -158,6 +171,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	var current_term int 
+	var voted_for int
+	var logs []Log
+
+	if decoder.Decode(&current_term) != nil ||
+	   decoder.Decode(&voted_for) != nil ||
+	   decoder.Decode(&logs) != nil {
+		DPrintf("decoder error")
+	} else {
+		rf.current_term = current_term
+		rf.voted_for = voted_for
+		rf.logs = logs
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -353,6 +382,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 			Term:    term,
 		})
+		rf.persist()
 		rf.match_index[rf.me] = len(rf.logs) - 1
 		DPrintf("leader %d add term: %d, command: %v", rf.me, rf.logs[index].Term, rf.logs[index].Command)
 	}
@@ -412,6 +442,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.apply_cv = sync.Cond{
 		L: &rf.mu,
 	}
+
+	rf.readPersist(persister.ReadRaftState())
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -613,6 +645,7 @@ func (rf *Raft) checkUpdateLogs(args *AppendEntriesArgs) {
 		entries_idx++
 	}
 	rf.logs = append(rf.logs, args.Entries[entries_idx:]...)
+	rf.persist()
 }
 
 /** Check if it is necessary to update the current term and transition back to being a follower.
@@ -628,6 +661,7 @@ func (rf *Raft) checkUpdateTerm(term int) bool {
 		rf.current_term = term
 		rf.current_state = FOLLOWER
 		rf.voted_for = -1
+		rf.persist()
 	}
 	return true
 }
@@ -674,6 +708,7 @@ func (rf *Raft) initElection() *RequestVoteArgs {
 	defer rf.mu.Unlock()
 	rf.current_term++
 	rf.voted_for = rf.me
+	rf.persist()
 	rf.resetElectionTimer()
 
 	DPrintf("server %d begin election with term %d", rf.me, rf.current_term)
