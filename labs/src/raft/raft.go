@@ -258,39 +258,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-
 	reply.Term = rf.current_term
 	reply.Success = false
-	if len(rf.logs) <= args.Prev_log_index {
-		reply.Conflict_index = len(rf.logs)
-		reply.Conflict_term = -1
+	
+	if !rf.fillConflictReply(args, reply) {
 		return 
 	}
-	
-	if rf.logs[args.Prev_log_index].Term != args.Prev_log_term {
-		// DPrintf("server %d refuse message from leader %d due to the log inconsistency, current logs: %v", rf.me, args.Leader_id, rf.logs)
-		reply.Conflict_term = rf.logs[args.Prev_log_index].Term
-		reply.Conflict_index = args.Prev_log_index
-
-		for idx := args.Prev_log_index - 1; idx > 0; idx-- {
-			if rf.logs[idx].Term == reply.Conflict_term {
-				reply.Conflict_index = idx
-			}
-		}
-		return
-	}
-
-	// if len(args.Entries) != 0 {
-	// 	DPrintf("server %d received message from leader %d with index: %v", rf.me, args.Leader_id, args.Prev_log_index)
-	// }
 
 	if len(args.Entries) != 0 {
 		rf.checkUpdateLogs(args)
 	}
-
-	// if len(args.Entries) != 0 {
-	// 	DPrintf("now the log entries of server %d are %v", rf.me, rf.logs)
-	// }
 
 
 	if args.Leader_commit_index > rf.commit_index {
@@ -524,10 +501,10 @@ func (rf *Raft) startApplyLogsToStateMachine() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for {
+		rf.apply_cv.Wait()
 		if rf.killed() {
 			return 
 		}
-		rf.apply_cv.Wait()
 
 		for rf.last_applied < rf.commit_index {
 			rf.last_applied++
@@ -555,113 +532,9 @@ func (rf *Raft) startApplyLogsToStateMachine() {
  * 	receiving replies from all other servers
  */
 func (rf *Raft) beginElection() {
-	rf.mu.Lock()
-	if rf.current_state != CANDIDATE {
-		rf.mu.Unlock()
-		return
-	}
-
-	rf.current_term++
-
-	DPrintf("server %d begin election with term %d", rf.me, rf.current_term)
-
-	rf.voted_for = rf.me
-	rf.resetElectionTimer()
-	args := RequestVoteArgs{
-		Term:          rf.current_term,
-		Candidate_id:  rf.me,
-		Last_log_idx:  len(rf.logs) - 1,
-		Last_log_term: rf.logs[len(rf.logs)-1].Term,
-	}
-	rf.mu.Unlock()
-
-	voted_num := 1
-	voted_mu := sync.Mutex{}
-	voted_fin_flag := false
-	voted_fin_cv := sync.Cond{
-		L: &voted_mu,
-	}
-
-	for id := 0; id < len(rf.peers); id++ {
-		if id != rf.me {
-			go func(server int) {
-				reply := RequestVoteReply{}
-				for !rf.sendRequestVote(server, &args, &reply) {
-					if rf.killed() {
-						voted_mu.Lock()
-						if voted_fin_flag && server == len(rf.peers) - 1 {
-							voted_fin_flag = true
-							voted_fin_cv.Signal()
-						}
-						voted_mu.Unlock()
-						return 
-					}
-					reply = RequestVoteReply{}
-				}
-
-				rf.mu.Lock()
-
-				if args.Term != rf.current_term{
-					rf.mu.Unlock()
-					voted_mu.Lock()
-					if !voted_fin_flag && server == len(rf.peers) - 1{
-						voted_fin_flag = true
-						voted_fin_cv.Signal()
-					}
-					voted_mu.Unlock()
-					return 		
-				}
-				rf.mu.Unlock()
-
-				voted_mu.Lock()
-				defer voted_mu.Unlock()
-
-				if voted_fin_flag {
-					return
-				}
-
-				if reply.VotedGranted {
-					voted_num++
-					if voted_num > len(rf.peers)/2 {
-						voted_fin_flag = true
-						voted_fin_cv.Signal()
-					}
-				}
-
-				// last peers'response, and didn't win this election
-				if !voted_fin_flag && server == len(rf.peers)-1 {
-					voted_fin_flag = true
-					voted_fin_cv.Signal()
-				}
-			}(id)
-		}
-	}
-
-	voted_mu.Lock()
-	for !voted_fin_flag {
-		voted_fin_cv.Wait()
-	}
-	voted_mu.Unlock()
-
-	rf.mu.Lock()
-	if voted_num > len(rf.peers)/2 && rf.current_state == CANDIDATE && rf.current_term == args.Term{
-		// become a leader
-		DPrintf("%d becomes a LEADER with term %d", rf.me, rf.current_term)
-		rf.current_state = LEADER
-		for idx := range rf.next_index {
-			rf.next_index[idx] = len(rf.logs)
-			rf.match_index[idx] = 0
-			if idx == rf.me {
-				rf.match_index[idx] = len(rf.logs) - 1
-			}
-		}
-		rf.mu.Unlock()
-		rf.beginHeartbeats()
-	} else {
-		rf.mu.Unlock()
-	}
+	args := rf.initElection()
+	rf.sendElection(args)
 }
-
 
 /** start a heartbeats
  * 	doesn't wait for replies
@@ -703,6 +576,29 @@ func (rf *Raft) updateCommitIndex() {
 		rf.commit_index = n
 		rf.apply_cv.Signal()
 	}
+}
+
+// return true if no log inconsistency, false otherwise
+func (rf *Raft) fillConflictReply(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	if len(rf.logs) <= args.Prev_log_index {
+		reply.Conflict_index = len(rf.logs)
+		reply.Conflict_term = -1
+		return false 
+	}
+	
+	if rf.logs[args.Prev_log_index].Term != args.Prev_log_term {
+		// DPrintf("server %d refuse message from leader %d due to the log inconsistency, current logs: %v", rf.me, args.Leader_id, rf.logs)
+		reply.Conflict_term = rf.logs[args.Prev_log_index].Term
+		reply.Conflict_index = args.Prev_log_index
+
+		for idx := args.Prev_log_index - 1; idx > 0; idx-- {
+			if rf.logs[idx].Term == reply.Conflict_term {
+				reply.Conflict_index = idx
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func (rf *Raft) checkUpdateLogs(args *AppendEntriesArgs) {
@@ -772,11 +668,92 @@ func (rf *Raft) decreaseNextIndex(server_id int, reply *AppendEntriesReply) {
 	}
 }
 
-
-
-
 // caller can't hold rf.mu.Lock()
+func (rf *Raft) initElection() *RequestVoteArgs {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.current_term++
+	rf.voted_for = rf.me
+	rf.resetElectionTimer()
 
+	DPrintf("server %d begin election with term %d", rf.me, rf.current_term)
+
+	return &RequestVoteArgs{
+		Term:          rf.current_term,
+		Candidate_id:  rf.me,
+		Last_log_idx:  len(rf.logs) - 1,
+		Last_log_term: rf.logs[len(rf.logs) - 1].Term,
+	}
+}
+
+func (rf *Raft) sendElection(args *RequestVoteArgs) {
+	voted_num := 1
+	voted_mu := sync.Mutex{}
+	voted_fin_flag := false
+	voted_fin_cv := sync.Cond{
+		L: &voted_mu,
+	}
+
+	for id := 0; id < len(rf.peers); id++ {
+		if id != rf.me {
+			go func(server_id int) {
+				reply := rf.sendRequestVoteRepeat(server_id, args)
+				if rf.isTermOrStateStale(args.Term, CANDIDATE) {
+					rf.exitSendElection(server_id, &voted_num, &voted_fin_flag, &voted_mu, &voted_fin_cv)
+				}	
+
+				voted_mu.Lock()
+				if voted_fin_flag {
+					voted_mu.Unlock()
+					return 
+				}
+				
+				if reply.VotedGranted {
+					voted_num++
+				}
+				voted_mu.Unlock()
+
+				rf.exitSendElection(server_id, &voted_num, &voted_fin_flag, &voted_mu, &voted_fin_cv)
+			}(id)
+		}
+	}
+
+	voted_mu.Lock()
+	for !voted_fin_flag {
+		voted_fin_cv.Wait()
+	}
+	voted_mu.Unlock()
+
+	rf.becomeLeader(voted_num, args.Term)
+}
+
+func (rf *Raft) becomeLeader(voted_num int, origin_term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if voted_num > len(rf.peers) / 2 && rf.current_state == CANDIDATE && rf.current_term == origin_term {
+		DPrintf("%d becomes a LEADER with term %d", rf.me, rf.current_term)
+		rf.current_state = LEADER
+		for idx := range rf.next_index {
+			rf.next_index[idx] = len(rf.logs)
+			rf.match_index[idx] = 0
+			
+			// we know our own match index 
+			if idx == rf.me {
+				rf.match_index[idx] = len(rf.logs) - 1
+			}
+		}
+		go rf.beginHeartbeats()
+	} 
+}
+
+func (rf *Raft) exitSendElection(server_id int, voted_num *int, flag *bool, mu *sync.Mutex, cv *sync.Cond) {
+	mu.Lock()
+	defer mu.Unlock()
+	if !*flag && (server_id == len(rf.peers) - 1 || *voted_num > len(rf.peers) / 2){
+		*flag = true
+		cv.Signal()
+	}
+}
 
 func (rf *Raft) generateAppendEntriesArgsForAllServers() []*AppendEntriesArgs{
 	rf.mu.Lock()
@@ -800,10 +777,21 @@ func (rf *Raft) sendHeartbeats(args []*AppendEntriesArgs) {
 	}	
 }
 
+func (rf *Raft) sendRequestVoteRepeat(server_id int, args *RequestVoteArgs) *RequestVoteReply{
+	reply := RequestVoteReply{}
+	for !rf.sendRequestVote(server_id, args, &reply) {
+		if rf.killed() || rf.isTermOrStateStale(args.Term, CANDIDATE) {
+			break
+		}
+		reply = RequestVoteReply{}
+	}
+	return &reply
+}
+
 func (rf *Raft) sendAppendEntriesRepeat(server_id int, args *AppendEntriesArgs) *AppendEntriesReply{
 	reply := AppendEntriesReply{}
 	for !rf.sendAppendEntries(server_id, args, &reply) {
-		if rf.killed() || rf.isTermStale(args.Term) {
+		if rf.killed() || rf.isTermOrStateStale(args.Term, LEADER) {
 			break 
 		}
 		reply = AppendEntriesReply{}
@@ -811,16 +799,16 @@ func (rf *Raft) sendAppendEntriesRepeat(server_id int, args *AppendEntriesArgs) 
 	return &reply
 }
 
-func (rf *Raft) isTermStale(origin_term int) bool {
+func (rf *Raft) isTermOrStateStale(origin_term int, origin_state State) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return origin_term != rf.current_term
+	return origin_term != rf.current_term || origin_state != rf.current_state
 }
 
 func (rf *Raft) sendSingleHeartbeats(server_id int, args *AppendEntriesArgs) {
 	reply := rf.sendAppendEntriesRepeat(server_id, args)
 
-	if rf.isTermStale(args.Term) {
+	if rf.isTermOrStateStale(args.Term, LEADER) {
 		return 
 	}
 
@@ -829,7 +817,7 @@ func (rf *Raft) sendSingleHeartbeats(server_id int, args *AppendEntriesArgs) {
 			return
 		}
 
-		if rf.isTermStale(args.Term) {
+		if rf.isTermOrStateStale(args.Term, LEADER) {
 			return 
 		}
 
@@ -844,7 +832,7 @@ func (rf *Raft) sendSingleHeartbeats(server_id int, args *AppendEntriesArgs) {
 		
 		reply = rf.sendAppendEntriesRepeat(server_id, args)
 
-		if rf.isTermStale(args.Term) {
+		if rf.isTermOrStateStale(args.Term, LEADER) {
 			return
 		}
 	}
