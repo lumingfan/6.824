@@ -1,6 +1,6 @@
 package models
 
-import "../porcupine"
+import "src/porcupine"
 import "fmt"
 import "sort"
 
