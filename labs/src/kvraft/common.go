@@ -20,14 +20,18 @@ type PutAppendArgs struct {
 
 type PutAppendReply struct {
 	Err Err
+	Is_leader bool
 }
 
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ClientId int
+	SeqNo int
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+	Is_leader bool
 }

@@ -1,13 +1,17 @@
 package kvraft
 
-import "src/labrpc"
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"math/big"
+	"src/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	
+	// cache the leader id
+	leader_id int
 }
 
 func nrand() int64 {
@@ -21,6 +25,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.leader_id = 0
 	return ck
 }
 
@@ -37,10 +42,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key:      key,
+	}
+	reply := GetReply{}
+
+	ok := ck.CallSingleGet(ck.leader_id, &args, &reply)
+
+	for !ok {
+		for server_id := 0; server_id < len(ck.servers); server_id++ {
+			reply = GetReply{}
+			ok = ck.CallSingleGet(server_id, &args, &reply)
+			if ok {
+				ck.leader_id = server_id
+				return reply.Value
+			}
+		}
+	}
+	return reply.Value
 }
+
+
 
 //
 // shared by Put and Append.
@@ -54,11 +77,48 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:   key,
+		Value: value,
+		Op:    op,
+	}	
+	reply := PutAppendReply{}
+
+	ok := ck.CallSinglePutAppend(ck.leader_id, op, &args, &reply)
+	for !ok {
+		for server_id := 0; server_id < len(ck.servers); server_id++ {
+			reply = PutAppendReply{}
+			ok = ck.CallSinglePutAppend(server_id, op, &args, &reply)
+			if ok {
+				ck.leader_id = server_id
+				return
+			}
+		}
+	}
 }
+
 
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+
+// helper functions
+func (ck *Clerk) CallSingleGet(server_id int, args *GetArgs, reply *GetReply) bool {
+	ok := ck.servers[server_id].Call("KVServer.Get", args, reply)
+	if !ok || !reply.Is_leader {
+		return false
+	}
+	return true
+}
+
+func (ck *Clerk) CallSinglePutAppend(server_id int, op string, args *PutAppendArgs, reply *PutAppendReply) bool {
+	ok := ck.servers[server_id].Call("KVServer.PutAppend", args, reply)
+	if !ok || !reply.Is_leader {
+		return false
+	}
+	return true
 }
