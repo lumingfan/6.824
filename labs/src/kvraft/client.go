@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"src/labrpc"
 	"sync"
+	"time"
 )
 
 var client_id int = 0
@@ -67,15 +68,17 @@ func (ck *Clerk) Get(key string) string {
 	ck.mu.Unlock()
 	reply := GetReply{}
 
+	DPrintf("send seqno: %d to server %d", args.SeqNo, ck.leader_id)
 	ok := ck.CallSingleGet(ck.leader_id, &args, &reply)
 
 	for !ok {
 		for server_id := 0; server_id < len(ck.servers); server_id++ {
-			reply = GetReply{}
-			ok = ck.CallSingleGet(server_id, &args, &reply)
+			new_reply := GetReply{}
+			DPrintf("send seqno: %d to server %d", args.SeqNo, server_id)
+			ok = ck.CallSingleGet(server_id, &args, &new_reply)
 			if ok {
 				ck.leader_id = server_id
-				return reply.Value
+				return new_reply.Value
 			}
 		}
 	}
@@ -108,11 +111,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.mu.Unlock()
 	reply := PutAppendReply{}
 
+	DPrintf("send seqno: %d to server %d", args.SeqNo, ck.leader_id)
 	ok := ck.CallSinglePutAppend(ck.leader_id, op, &args, &reply)
 	for !ok {
 		for server_id := 0; server_id < len(ck.servers); server_id++ {
-			reply = PutAppendReply{}
-			ok = ck.CallSinglePutAppend(server_id, op, &args, &reply)
+			new_reply := PutAppendReply{}
+			DPrintf("send seqno: %d to server %d", args.SeqNo, server_id)
+			ok = ck.CallSinglePutAppend(server_id, op, &args, &new_reply)
 			if ok {
 				ck.leader_id = server_id
 				return
@@ -132,17 +137,39 @@ func (ck *Clerk) Append(key string, value string) {
 
 // helper functions
 func (ck *Clerk) CallSingleGet(server_id int, args *GetArgs, reply *GetReply) bool {
-	ok := ck.servers[server_id].Call("KVServer.Get", args, reply)
-	if !ok || !reply.Is_leader {
+	ok_ch := make(chan bool)
+	timer := time.NewTimer(500 * time.Millisecond)
+	go func() {
+		ret := ck.servers[server_id].Call("KVServer.Get", args, reply)
+		ok_ch <- ret
+	}()
+
+	select {
+	case <-timer.C:
 		return false
+	case ok := <-ok_ch:
+		if !ok || !reply.Is_leader {
+			return false
+		}
+		return true
 	}
-	return true
 }
 
 func (ck *Clerk) CallSinglePutAppend(server_id int, op string, args *PutAppendArgs, reply *PutAppendReply) bool {
-	ok := ck.servers[server_id].Call("KVServer.PutAppend", args, reply)
-	if !ok || !reply.Is_leader {
+	ok_ch := make(chan bool)
+	timer := time.NewTimer(500 * time.Millisecond)
+	go func() {
+		ret := ck.servers[server_id].Call("KVServer.PutAppend", args, reply)
+		ok_ch <- ret
+	}()
+
+	select {
+	case <-timer.C:
 		return false
+	case ok := <-ok_ch:
+		if !ok || !reply.Is_leader {
+			return false
+		}
+		return true
 	}
-	return true
 }
