@@ -4,7 +4,11 @@ import (
 	"crypto/rand"
 	"math/big"
 	"src/labrpc"
+	"sync"
 )
+
+var client_id int = 0
+var mu sync.Mutex = sync.Mutex{}
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -12,6 +16,10 @@ type Clerk struct {
 	
 	// cache the leader id
 	leader_id int
+
+	me int
+	seq_no int
+	mu sync.Mutex
 }
 
 func nrand() int64 {
@@ -22,10 +30,16 @@ func nrand() int64 {
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
+	mu.Lock()
+	defer mu.Unlock()
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.leader_id = 0
+	ck.seq_no = 0
+	ck.me = client_id
+	ck.mu = sync.Mutex{}
+	client_id++
 	return ck
 }
 
@@ -43,9 +57,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
+	ck.mu.Lock()
 	args := GetArgs{
 		Key:      key,
+		ClientId: ck.me,
+		SeqNo:    ck.seq_no,
 	}
+	ck.seq_no++
+	ck.mu.Unlock()
 	reply := GetReply{}
 
 	ok := ck.CallSingleGet(ck.leader_id, &args, &reply)
@@ -77,11 +96,16 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
 	args := PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.me,
+		SeqNo:    ck.seq_no,
 	}	
+	ck.seq_no++
+	ck.mu.Unlock()
 	reply := PutAppendReply{}
 
 	ok := ck.CallSinglePutAppend(ck.leader_id, op, &args, &reply)

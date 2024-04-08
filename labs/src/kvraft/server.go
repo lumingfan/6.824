@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -25,6 +25,14 @@ type Op struct {
 	Op_name string
 	Key string
 	Value string
+	ClientId int
+	SeqNo int
+}
+
+type RequestInfo struct {
+	cv *sync.Cond
+	operation Op
+	reply interface{}
 }
 
 type KVServer struct {
@@ -37,80 +45,26 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	
+	// key/value state
 	key_value map[string]string
 
-	applied_command_idx int
-	apply_cv sync.Cond
+	// client id maps to latest sequence no
+	seqnos map[int]int
+
+	// request information at a specific index
+	request_infos map[int][]RequestInfo
+
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	kv.mu.Lock()	
-	defer kv.mu.Unlock()
-
-	op := Op{
-		Op_name: "Get",
-		Key:     args.Key,
-		Value:   "",
-	}
-
-	DPrintf("leader %d received a Get RPC call with key: %s", kv.me, args.Key)
-
-	idx, _, is_leader := kv.rf.Start(op)
-	reply.Is_leader = is_leader
-
-	if !is_leader {
-		return 
-	}
-
-	DPrintf("leader %d start a Get RPC call with key: %s at index %d", kv.me, args.Key, idx)
-
-	// can't use idx != kv.applied_command_idx 
-	// since with mesa schedule, this threads may win the lock after kv.applied_command_idx updated again
-	for idx > kv.applied_command_idx {
-		kv.apply_cv.Wait()
-	}
-
-	DPrintf("leader %d commit a Get RPC call with key: %s at index %d", kv.me, args.Key, idx)
-
-	reply.Value = kv.key_value[args.Key]
+	kv.RPCHandler("Get", args, reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	op := Op{
-		Op_name: args.Op,
-		Key:     args.Key,
-		Value:   args.Value,
-	}
-
-	DPrintf("leader %d received a PutAppend RPC call with args: %v", kv.me, args)
-	
-	idx, _, is_leader := kv.rf.Start(op)
-	reply.Is_leader = is_leader
-
-	if !is_leader {
-		return 
-	}
-
-	DPrintf("leader %d start a PutAppend RPC call with args: %v", kv.me, args)
-
-	// can't use idx != kv.applied_command_idx 
-	// since with mesa schedule, this threads may win the lock after kv.applied_command_idx updated again
-	for idx > kv.applied_command_idx {
-		kv.apply_cv.Wait()
-	}
-
-	if args.Op == "Put" {
-		kv.key_value[args.Key] = args.Value
-	} else if args.Op == "Append" {
-		kv.key_value[args.Key] += args.Value
-	} else {
-		panic("doesn't support operation: " + args.Op)
-	}
+	kv.RPCHandler(args.Op, args, reply)
 }
 
 //
@@ -160,15 +114,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		dead:                0,
 		maxraftstate:        maxraftstate,
 		key_value:           map[string]string{},
-		applied_command_idx: -1,
-		apply_cv:            sync.Cond{},
+		seqnos:              map[int]int{},
+		request_infos:       map[int][]RequestInfo{},
 	}
 
 	// You may need initialization code here.
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.apply_cv = sync.Cond{
-		L: &kv.mu,
-	}
 
 	go kv.waitApplyChannel()
 	return kv
@@ -183,19 +134,95 @@ func (kv *KVServer) waitApplyChannel() {
 		if !apply_msg.CommandValid {
 
 		} else {
-			DPrintf("%v committed", apply_msg)
 			kv.mu.Lock()
-			DPrintf("notify %v committed", apply_msg)
-			kv.applied_command_idx = apply_msg.CommandIndex
-			kv.apply_cv.Broadcast()
+			op := apply_msg.Command.(Op)
+
+			req_info_list := kv.request_infos[apply_msg.CommandIndex]
+
+			seqno, ok := kv.seqnos[op.ClientId] 
+
+			if !ok || (ok &&  op.SeqNo > seqno) {
+				DPrintf("server %d submit operation: %v", kv.me, op)
+				kv.seqnos[op.ClientId] = op.SeqNo
+				
+				if op.Op_name == "Put" {
+					kv.key_value[op.Key] = op.Value
+				} else if op.Op_name == "Append" {
+					kv.key_value[op.Key] += op.Value
+				}
+			} else {
+				DPrintf("server %d reject stale operation: %v", kv.me, op)
+			}
+			
+			for idx := 0; idx < len(req_info_list); idx++ {
+				if req_info_list[idx].operation == op {
+					if op.Op_name == "Get" {
+						req_info_list[idx].reply.(*GetReply).Is_leader = true
+						req_info_list[idx].reply.(*GetReply).Value = kv.key_value[op.Key]
+					} else {
+						req_info_list[idx].reply.(*PutAppendReply).Is_leader = true
+					}
+				} else {
+					if req_info_list[idx].operation.Op_name == "Get" {
+						req_info_list[idx].reply.(*GetReply).Is_leader = false
+						req_info_list[idx].reply.(*GetReply).Err = "leader has changed"
+					} else {
+						req_info_list[idx].reply.(*PutAppendReply).Is_leader = false
+						req_info_list[idx].reply.(*PutAppendReply).Err = "leader has changed"
+					}
+				}
+				req_info_list[idx].cv.Signal()
+			}
+
+			delete(kv.request_infos, apply_msg.CommandIndex)
 			kv.mu.Unlock()
-			DPrintf("notify %v committed finished", apply_msg)
 		}
 
 		if kv.killed() {
 			break
 		}
 	}
+}
+
+func (kv *KVServer) RPCHandler(op_name string, args interface{}, reply interface{}) {
+	kv.mu.Lock()	
+	defer kv.mu.Unlock()
+
+	op := Op{}
+	op.Op_name = op_name
+
+	if op_name == "Get" {
+		op.Key = args.(*GetArgs).Key
+		op.Value = ""
+		op.ClientId = args.(*GetArgs).ClientId
+		op.SeqNo = args.(*GetArgs).SeqNo
+	} else if op_name == "Put" || op_name == "Append" {
+		op.Key = args.(*PutAppendArgs).Key
+		op.Value = args.(*PutAppendArgs).Value
+		op.ClientId = args.(*PutAppendArgs).ClientId
+		op.SeqNo = args.(*PutAppendArgs).SeqNo
+	}
+
+	idx, _, is_leader := kv.rf.Start(op)
+
+	if op_name == "Get" {
+		reply.(*GetReply).Is_leader = is_leader
+	}  else {
+		reply.(*PutAppendReply).Is_leader = is_leader
+	}
+
+	if !is_leader {
+		return 
+	}
+
+	info := RequestInfo{
+		cv:        &sync.Cond{L: &kv.mu},
+		operation: op,
+		reply:     reply,
+	}
+
+	kv.request_infos[idx] = append(kv.request_infos[idx], info)
+	info.cv.Wait()
 }
 
 
