@@ -230,30 +230,6 @@ type AppendEntriesReply struct {
 	Conflict_index int
 }
 
-/** Check the validation of the candidate
- *  must be called with the lock held by the caller
- */
-func (rf *Raft) checkValidCandidate(candidate_term int, candidate_index int, candidate_id int) bool {
-	if rf.current_state != FOLLOWER {
-		return false
-	}
-
-	if rf.voted_for != -1 && rf.voted_for != candidate_id {
-		return false
-	}
-
-	if rf.logs[len(rf.logs) - 1].Term > candidate_term {
-		return false
-	}
-
-	if rf.logs[len(rf.logs) - 1].Term == candidate_term {
-		if len(rf.logs) > candidate_index+1 {
-			return false
-		}
-	}
-	return true
-}
-
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
@@ -529,6 +505,10 @@ func (rf *Raft) startHeartBeatsTimer() {
 	}
 }
 
+/** Apply committed logs to state machine after woken up by rf.apply_cv.Signal()
+ * 	only called once in Make as a goroutine
+ */
+
 func (rf *Raft) startApplyLogsToStateMachine() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -560,8 +540,6 @@ func (rf *Raft) startApplyLogsToStateMachine() {
 }
 
 /** start a new election
- * 	wait for obtaining a majority of votes or
- * 	receiving replies from all other servers
  */
 func (rf *Raft) beginElection() {
 	args := rf.initElection()
@@ -569,88 +547,41 @@ func (rf *Raft) beginElection() {
 }
 
 /** start a heartbeats
- * 	doesn't wait for replies
  */
 func (rf *Raft) beginHeartbeats() {
 	args := rf.generateAppendEntriesArgsForAllServers()
 	rf.sendHeartbeats(args)
 }
 
-// called must hold rf.mu.lock()
-func (rf *Raft) generateAppendEntriesArgs(server_id int) *AppendEntriesArgs {
-	return &AppendEntriesArgs{
-		Term:                rf.current_term,
-		Leader_id:           rf.me,
-		Prev_log_index:      rf.next_index[server_id] - 1,
-		Prev_log_term:       rf.logs[rf.next_index[server_id] - 1].Term,
-		Entries:             append([]Log{}, rf.logs[rf.next_index[server_id]:]...),
-		Leader_commit_index: rf.commit_index,
-	}
-}
+/**---------------- Helper functions ---------------**/
+
+/* ----- caller must hold rf.mu.lock() ----- */
 
 
-func (rf *Raft) updateCommitIndex() {
-	match_idx_temp := make([]int, len(rf.match_index))
-	copy(match_idx_temp, rf.match_index)
-
-	sort.Slice(match_idx_temp, func(i, j int) bool {
-		return match_idx_temp[i] < match_idx_temp[j]
-	})
-
-	var n int
-	if len(match_idx_temp) % 2 == 0 {
-		n = match_idx_temp[len(match_idx_temp) / 2 - 1]	
-	} else {
-		n = match_idx_temp[len(match_idx_temp) / 2]
-	}
-
-	if n > rf.commit_index && rf.logs[n].Term == rf.current_term {
-		rf.commit_index = n
-		rf.apply_cv.Signal()
-	}
-}
-
-// return true if no log inconsistency, false otherwise
-func (rf *Raft) fillConflictReply(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	if len(rf.logs) <= args.Prev_log_index {
-		reply.Conflict_index = len(rf.logs)
-		reply.Conflict_term = -1
-		return false 
-	}
-	
-	if rf.logs[args.Prev_log_index].Term != args.Prev_log_term {
-		// DPrintf("server %d refuse message from leader %d due to the log inconsistency, current logs: %v", rf.me, args.Leader_id, rf.logs)
-		reply.Conflict_term = rf.logs[args.Prev_log_index].Term
-		reply.Conflict_index = args.Prev_log_index
-
-		for idx := args.Prev_log_index - 1; idx > 0; idx-- {
-			if rf.logs[idx].Term == reply.Conflict_term {
-				reply.Conflict_index = idx
-			}
-		}
+/** Check the validation of the candidate
+ */
+func (rf *Raft) checkValidCandidate(candidate_term int, candidate_index int, candidate_id int) bool {
+	if rf.current_state != FOLLOWER {
 		return false
+	}
+
+	if rf.voted_for != -1 && rf.voted_for != candidate_id {
+		return false
+	}
+
+	if rf.logs[len(rf.logs) - 1].Term > candidate_term {
+		return false
+	}
+
+	if rf.logs[len(rf.logs) - 1].Term == candidate_term {
+		if len(rf.logs) > candidate_index+1 {
+			return false
+		}
 	}
 	return true
 }
 
-func (rf *Raft) checkUpdateLogs(args *AppendEntriesArgs) {
-	logs_idx := args.Prev_log_index + 1 
-	entries_idx := 0
-	for entries_idx < len(args.Entries) && logs_idx < len(rf.logs) {
-		if rf.logs[logs_idx] != args.Entries[entries_idx] {
-			rf.logs = rf.logs[:logs_idx]	
-			break	
-		}
-		logs_idx++
-		entries_idx++
-	}
-	rf.logs = append(rf.logs, args.Entries[entries_idx:]...)
-	rf.persist()
-}
-
-/** Check if it is necessary to update the current term and transition back to being a follower.
- *  Called before processing a RPC request or
- * 	after receiving a RPC reply
+/** Check if the server needs to update the current_term and transition back to a follower.
  */
 func (rf *Raft) checkUpdateTerm(term int) bool {
 	if term < rf.current_term {
@@ -688,6 +619,89 @@ func (rf *Raft) checkUpdateTermAppEntVer(term int) bool {
 	return true
 }
 
+
+/** generate AppendEntriesArgs given the server_id
+ */
+func (rf *Raft) generateAppendEntriesArgs(server_id int) *AppendEntriesArgs {
+	return &AppendEntriesArgs{
+		Term:                rf.current_term,
+		Leader_id:           rf.me,
+		Prev_log_index:      rf.next_index[server_id] - 1,
+		Prev_log_term:       rf.logs[rf.next_index[server_id] - 1].Term,
+		Entries:             append([]Log{}, rf.logs[rf.next_index[server_id]:]...),
+		Leader_commit_index: rf.commit_index,
+	}
+}
+
+
+/** update commit index once match_index has been updated
+ *  then use rf.apply_cv.Signal() to apply new entries to state machine 
+ */
+func (rf *Raft) updateCommitIndex() {
+	match_idx_temp := make([]int, len(rf.match_index))
+	copy(match_idx_temp, rf.match_index)
+
+	sort.Slice(match_idx_temp, func(i, j int) bool {
+		return match_idx_temp[i] < match_idx_temp[j]
+	})
+
+	var n int
+	if len(match_idx_temp) % 2 == 0 {
+		n = match_idx_temp[len(match_idx_temp) / 2 - 1]	
+	} else {
+		n = match_idx_temp[len(match_idx_temp) / 2]
+	}
+
+	if n > rf.commit_index && rf.logs[n].Term == rf.current_term {
+		rf.commit_index = n
+		rf.apply_cv.Signal()
+	}
+}
+
+/** set Conflict_index, Conflict_term fields in reply
+ *  return true if no log inconsistency, false otherwise
+ */ 
+func (rf *Raft) fillConflictReply(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	if len(rf.logs) <= args.Prev_log_index {
+		reply.Conflict_index = len(rf.logs)
+		reply.Conflict_term = -1
+		return false 
+	}
+	
+	if rf.logs[args.Prev_log_index].Term != args.Prev_log_term {
+		// DPrintf("server %d refuse message from leader %d due to the log inconsistency, current logs: %v", rf.me, args.Leader_id, rf.logs)
+		reply.Conflict_term = rf.logs[args.Prev_log_index].Term
+		reply.Conflict_index = args.Prev_log_index
+
+		for idx := args.Prev_log_index - 1; idx > 0; idx-- {
+			if rf.logs[idx].Term == reply.Conflict_term {
+				reply.Conflict_index = idx
+			}
+		}
+		return false
+	}
+	return true
+}
+
+/** update the server(follower)'s logs given the leader's logs  
+ */
+func (rf *Raft) checkUpdateLogs(args *AppendEntriesArgs) {
+	logs_idx := args.Prev_log_index + 1 
+	entries_idx := 0
+	for entries_idx < len(args.Entries) && logs_idx < len(rf.logs) {
+		if rf.logs[logs_idx] != args.Entries[entries_idx] {
+			rf.logs = rf.logs[:logs_idx]	
+			break	
+		}
+		logs_idx++
+		entries_idx++
+	}
+	rf.logs = append(rf.logs, args.Entries[entries_idx:]...)
+	rf.persist()
+}
+
+/** move backwards next index for server_id according to reply.Conflict_term & reply.Conflict_idx
+ */ 
 func (rf *Raft) decreaseNextIndex(server_id int, reply *AppendEntriesReply) {
 	idx := len(rf.logs) - 1
 	for ; idx > 0; idx-- {
@@ -702,7 +716,10 @@ func (rf *Raft) decreaseNextIndex(server_id int, reply *AppendEntriesReply) {
 	}
 }
 
-// caller can't hold rf.mu.Lock()
+/* ----- caller can't hold rf.mu.lock() ----- */
+
+/** update states for beginning a new election and then return RequestVoteArgs to beginElection 
+ */
 func (rf *Raft) initElection() *RequestVoteArgs {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -721,6 +738,8 @@ func (rf *Raft) initElection() *RequestVoteArgs {
 	}
 }
 
+/**  send RequestVote RPC to other servers and wait for the response 
+ */ 
 func (rf *Raft) sendElection(args *RequestVoteArgs) {
 	voted_num := 1
 	voted_mu := sync.Mutex{}
@@ -763,6 +782,9 @@ func (rf *Raft) sendElection(args *RequestVoteArgs) {
 	rf.becomeLeader(voted_num, args.Term)
 }
 
+/** determine if this server can become a leader according to voted_num
+ *  origin_term is used to detect stale response
+ */
 func (rf *Raft) becomeLeader(voted_num int, origin_term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -782,6 +804,8 @@ func (rf *Raft) becomeLeader(voted_num int, origin_term int) {
 	} 
 }
 
+/** exit send RequestVote go routine safely
+ */
 func (rf *Raft) exitSendElection(server_id int, voted_num *int, flag *bool, mu *sync.Mutex, cv *sync.Cond) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -791,19 +815,8 @@ func (rf *Raft) exitSendElection(server_id int, voted_num *int, flag *bool, mu *
 	}
 }
 
-func (rf *Raft) generateAppendEntriesArgsForAllServers() []*AppendEntriesArgs{
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	args := make([]*AppendEntriesArgs, len(rf.peers))
-	for server_id:= 0; server_id < len(rf.peers); server_id++{
-		if server_id != rf.me {
-			args[server_id] = rf.generateAppendEntriesArgs(server_id)
-		}
-	}
-	return args
-}
-
-
+/** send AppendEntries RPC to all servers
+ */
 func (rf *Raft) sendHeartbeats(args []*AppendEntriesArgs) {
 	for server_id := 0; server_id < len(rf.peers); server_id++ {
 		if server_id == rf.me {
@@ -813,12 +826,8 @@ func (rf *Raft) sendHeartbeats(args []*AppendEntriesArgs) {
 	}	
 }
 
-func (rf *Raft) isTermOrStateStale(origin_term int, origin_state State) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return origin_term != rf.current_term || origin_state != rf.current_state
-}
-
+/** send AppendEntries RPC to a specified server
+ */ 
 func (rf *Raft) sendSingleHeartbeats(server_id int, args *AppendEntriesArgs) {
 	reply := AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server_id, args, &reply)
@@ -858,6 +867,33 @@ func (rf *Raft) sendSingleHeartbeats(server_id int, args *AppendEntriesArgs) {
 	}
 }
 
+
+/** generate AppendEntriesArgs for all servers (except for leader)
+ */
+func (rf *Raft) generateAppendEntriesArgsForAllServers() []*AppendEntriesArgs{
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	args := make([]*AppendEntriesArgs, len(rf.peers))
+	for server_id:= 0; server_id < len(rf.peers); server_id++{
+		if server_id != rf.me {
+			args[server_id] = rf.generateAppendEntriesArgs(server_id)
+		}
+	}
+	return args
+}
+
+
+/** is this term/state stale? 
+ */ 
+func (rf *Raft) isTermOrStateStale(origin_term int, origin_state State) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return origin_term != rf.current_term || origin_state != rf.current_state
+}
+
+
+/** update match_index/next_index for a specified server, then update commit index for leader
+ */
 func (rf *Raft) handleSingleHeartbeatsReply(server_id int, args *AppendEntriesArgs) {
 	// success: update next_index and match_idx for follower
 	rf.mu.Lock()
