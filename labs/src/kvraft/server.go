@@ -1,9 +1,9 @@
 package kvraft
 
 import (
+	"log"
 	"src/labgob"
 	"src/labrpc"
-	"log"
 	"src/raft"
 	"sync"
 	"sync/atomic"
@@ -22,16 +22,21 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op_name string
-	Key string
-	Value string
-	ClientId int
-	SeqNo int
+	Op_name  string // operation name: Get, Append, Put
+	Key      string
+	Value    string
+	ClientId int // which client sends this Op, used to detect duplication
+	SeqNo    int // which sequence number this Op corresponds used to detect duplication
 }
 
+/** RPC request information
+ */
 type RequestInfo struct {
-	cv *sync.Cond
+	cv        *sync.Cond
 	operation Op
+
+	// reply is a pointer to PutAppendReply/GetReply
+	// set by waitApplyChannel
 	reply interface{}
 }
 
@@ -45,16 +50,15 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	
+
 	// key/value state
 	key_value map[string]string
 
 	// client id maps to latest sequence no
 	seqnos map[int]int
 
-	// request information at a specific index
+	// rpc request information at a specific index
 	request_infos map[int][]RequestInfo
-
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -67,7 +71,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.RPCHandler(args.Op, args, reply)
 }
 
-//
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -76,7 +79,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // code to Kill(). you're not required to do anything
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
-//
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -88,7 +90,6 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-//
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -101,21 +102,20 @@ func (kv *KVServer) killed() bool {
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 	kv := &KVServer{
-		mu:                  sync.Mutex{},
-		me:                  me,
-		rf:                  nil,
-		applyCh:             make(chan raft.ApplyMsg),
-		dead:                0,
-		maxraftstate:        maxraftstate,
-		key_value:           map[string]string{},
-		seqnos:              map[int]int{},
-		request_infos:       map[int][]RequestInfo{},
+		mu:            sync.Mutex{},
+		me:            me,
+		rf:            nil,
+		applyCh:       make(chan raft.ApplyMsg),
+		dead:          0,
+		maxraftstate:  maxraftstate,
+		key_value:     map[string]string{},
+		seqnos:        map[int]int{},
+		request_infos: map[int][]RequestInfo{},
 	}
 
 	// You may need initialization code here.
@@ -125,56 +125,72 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	return kv
 }
 
+/**---------------- Helper functions ---------------**/
 
-// helper function
+/* ----- caller must hold kv.mu.Lock() ----- */
 
-// caller can't hold kv.mu.Lock
+/** apply given operation to state machine (if not a duplication)
+ */
+func (kv *KVServer) applyToStateMachine(op Op) {
+	seqno, ok := kv.seqnos[op.ClientId]
+
+	if !ok || (ok && op.SeqNo > seqno) {
+		DPrintf("server %d submit operation: %v", kv.me, op)
+		kv.seqnos[op.ClientId] = op.SeqNo
+
+		if op.Op_name == "Put" {
+			kv.key_value[op.Key] = op.Value
+		} else if op.Op_name == "Append" {
+			kv.key_value[op.Key] += op.Value
+		}
+	} else {
+		DPrintf("server %d reject stale operation: %v", kv.me, op)
+	}
+}
+
+/** signal rpc handlers wait at command_index
+ */
+func (kv *KVServer) signalRPCHandler(command_index int, op Op) {
+	req_info_list := kv.request_infos[command_index]
+	for idx := 0; idx < len(req_info_list); idx++ {
+		if req_info_list[idx].operation == op {
+			if op.Op_name == "Get" {
+				req_info_list[idx].reply.(*GetReply).Is_leader = true
+				req_info_list[idx].reply.(*GetReply).Value = kv.key_value[op.Key]
+			} else {
+				req_info_list[idx].reply.(*PutAppendReply).Is_leader = true
+			}
+		} else {
+			if req_info_list[idx].operation.Op_name == "Get" {
+				req_info_list[idx].reply.(*GetReply).Is_leader = false
+				req_info_list[idx].reply.(*GetReply).Err = "leader has changed"
+			} else {
+				req_info_list[idx].reply.(*PutAppendReply).Is_leader = false
+				req_info_list[idx].reply.(*PutAppendReply).Err = "leader has changed"
+			}
+		}
+		req_info_list[idx].cv.Signal()
+	}
+
+	delete(kv.request_infos, command_index)
+}
+
+
+/* ----- caller can't hold kv.mu.Lock() ----- */
+
+/** wait for raft to send apply_msg to applyCh
+ *  then apply this operation to state machine(if not a duplication)
+ *  and signal rpc handler
+ */
 func (kv *KVServer) waitApplyChannel() {
-	for apply_msg := range kv.applyCh{
+	for apply_msg := range kv.applyCh {
 		if !apply_msg.CommandValid {
 
 		} else {
 			kv.mu.Lock()
 			op := apply_msg.Command.(Op)
-
-			req_info_list := kv.request_infos[apply_msg.CommandIndex]
-
-			seqno, ok := kv.seqnos[op.ClientId] 
-
-			if !ok || (ok &&  op.SeqNo > seqno) {
-				DPrintf("server %d submit operation: %v", kv.me, op)
-				kv.seqnos[op.ClientId] = op.SeqNo
-				
-				if op.Op_name == "Put" {
-					kv.key_value[op.Key] = op.Value
-				} else if op.Op_name == "Append" {
-					kv.key_value[op.Key] += op.Value
-				}
-			} else {
-				DPrintf("server %d reject stale operation: %v", kv.me, op)
-			}
-			
-			for idx := 0; idx < len(req_info_list); idx++ {
-				if req_info_list[idx].operation == op {
-					if op.Op_name == "Get" {
-						req_info_list[idx].reply.(*GetReply).Is_leader = true
-						req_info_list[idx].reply.(*GetReply).Value = kv.key_value[op.Key]
-					} else {
-						req_info_list[idx].reply.(*PutAppendReply).Is_leader = true
-					}
-				} else {
-					if req_info_list[idx].operation.Op_name == "Get" {
-						req_info_list[idx].reply.(*GetReply).Is_leader = false
-						req_info_list[idx].reply.(*GetReply).Err = "leader has changed"
-					} else {
-						req_info_list[idx].reply.(*PutAppendReply).Is_leader = false
-						req_info_list[idx].reply.(*PutAppendReply).Err = "leader has changed"
-					}
-				}
-				req_info_list[idx].cv.Signal()
-			}
-
-			delete(kv.request_infos, apply_msg.CommandIndex)
+			kv.applyToStateMachine(op)
+			kv.signalRPCHandler(apply_msg.CommandIndex, op)
 			kv.mu.Unlock()
 		}
 
@@ -185,7 +201,7 @@ func (kv *KVServer) waitApplyChannel() {
 }
 
 func (kv *KVServer) RPCHandler(op_name string, args interface{}, reply interface{}) {
-	kv.mu.Lock()	
+	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	op := Op{}
@@ -207,12 +223,12 @@ func (kv *KVServer) RPCHandler(op_name string, args interface{}, reply interface
 
 	if op_name == "Get" {
 		reply.(*GetReply).Is_leader = is_leader
-	}  else {
+	} else {
 		reply.(*PutAppendReply).Is_leader = is_leader
 	}
 
 	if !is_leader {
-		return 
+		return
 	}
 
 	info := RequestInfo{
@@ -224,6 +240,3 @@ func (kv *KVServer) RPCHandler(op_name string, args interface{}, reply interface
 	kv.request_infos[idx] = append(kv.request_infos[idx], info)
 	info.cv.Wait()
 }
-
-
-// caller must hold kv.mu.Lock
