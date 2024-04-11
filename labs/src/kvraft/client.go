@@ -76,13 +76,11 @@ func (ck *Clerk) Get(key string) string {
 	ck.mu.Unlock()
 	reply := GetReply{}
 
-	DPrintf("send seqno: %d to server %d", args.SeqNo, ck.leader_id)
 	ok := ck.CallSingleRPC(ck.leader_id, "Get", &args, &reply)
 
 	for !ok {
 		for server_id := 0; server_id < len(ck.servers); server_id++ {
 			new_reply := GetReply{}
-			DPrintf("send seqno: %d to server %d", args.SeqNo, server_id)
 			ok = ck.CallSingleRPC(server_id, "Get", &args, &new_reply)
 			if ok {
 				ck.leader_id = server_id
@@ -116,12 +114,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.mu.Unlock()
 	reply := PutAppendReply{}
 
-	DPrintf("send seqno: %d to server %d", args.SeqNo, ck.leader_id)
 	ok := ck.CallSingleRPC(ck.leader_id, "PutAppend", &args, &reply)
 	for !ok {
 		for server_id := 0; server_id < len(ck.servers); server_id++ {
 			new_reply := PutAppendReply{}
-			DPrintf("send seqno: %d to server %d", args.SeqNo, server_id)
 			ok = ck.CallSingleRPC(server_id, "PutAppend", &args, &new_reply)
 			if ok {
 				ck.leader_id = server_id

@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"src/labgob"
 	"src/labrpc"
@@ -9,7 +10,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -131,7 +132,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 /** apply given operation to state machine (if not a duplication)
  */
-func (kv *KVServer) applyToStateMachine(op Op) {
+func (kv *KVServer) applyToStateMachine(op Op, snapshot_idx int) {
 	seqno, ok := kv.seqnos[op.ClientId]
 
 	if !ok || (ok && op.SeqNo > seqno) {
@@ -145,6 +146,10 @@ func (kv *KVServer) applyToStateMachine(op Op) {
 		}
 	} else {
 		DPrintf("server %d reject stale operation: %v", kv.me, op)
+	}
+
+	if kv.maxraftstate != -1 && kv.rf.ReadStateSize() >= kv.maxraftstate {
+		kv.rf.SaveStateAndSnapshot(kv.key_value, kv.seqnos, snapshot_idx)
 	}
 }
 
@@ -175,6 +180,25 @@ func (kv *KVServer) signalRPCHandler(command_index int, op Op) {
 	delete(kv.request_infos, command_index)
 }
 
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return 
+	}
+
+	buffer := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(buffer)
+	var key_value map[string]string
+	var seqnos map[int]int
+
+	if decoder.Decode(&key_value) != nil ||
+	   decoder.Decode(&seqnos) != nil {
+		panic("decoder error")
+	} else {
+		kv.key_value = key_value
+		kv.seqnos = seqnos
+	}
+}
+
 
 /* ----- caller can't hold kv.mu.Lock() ----- */
 
@@ -184,15 +208,15 @@ func (kv *KVServer) signalRPCHandler(command_index int, op Op) {
  */
 func (kv *KVServer) waitApplyChannel() {
 	for apply_msg := range kv.applyCh {
+		kv.mu.Lock()
 		if !apply_msg.CommandValid {
-
+			kv.readSnapshot(apply_msg.Snapshot)
 		} else {
-			kv.mu.Lock()
 			op := apply_msg.Command.(Op)
-			kv.applyToStateMachine(op)
+			kv.applyToStateMachine(op, apply_msg.CommandIndex)
 			kv.signalRPCHandler(apply_msg.CommandIndex, op)
-			kv.mu.Unlock()
 		}
+		kv.mu.Unlock()
 
 		if kv.killed() {
 			break
