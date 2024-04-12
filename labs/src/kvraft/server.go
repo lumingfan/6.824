@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -60,6 +60,9 @@ type KVServer struct {
 
 	// rpc request information at a specific index
 	request_infos map[int][]RequestInfo
+
+	// last applied index
+	last_applied_idx int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -108,15 +111,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 	kv := &KVServer{
-		mu:            sync.Mutex{},
-		me:            me,
-		rf:            nil,
-		applyCh:       make(chan raft.ApplyMsg),
-		dead:          0,
-		maxraftstate:  maxraftstate,
-		key_value:     map[string]string{},
-		seqnos:        map[int]int{},
-		request_infos: map[int][]RequestInfo{},
+		mu:               sync.Mutex{},
+		me:               me,
+		rf:               nil,
+		applyCh:          make(chan raft.ApplyMsg),
+		dead:             0,
+		maxraftstate:     maxraftstate,
+		key_value:        map[string]string{},
+		seqnos:           map[int]int{},
+		request_infos:    map[int][]RequestInfo{},
+		last_applied_idx: 0,
 	}
 
 	// You may need initialization code here.
@@ -209,12 +213,17 @@ func (kv *KVServer) readSnapshot(snapshot []byte) {
 func (kv *KVServer) waitApplyChannel() {
 	for apply_msg := range kv.applyCh {
 		kv.mu.Lock()
-		if !apply_msg.CommandValid {
-			kv.readSnapshot(apply_msg.Snapshot)
-		} else {
-			op := apply_msg.Command.(Op)
-			kv.applyToStateMachine(op, apply_msg.CommandIndex)
-			kv.signalRPCHandler(apply_msg.CommandIndex, op)
+		if apply_msg.CommandIndex > kv.last_applied_idx {
+
+			if !apply_msg.CommandValid {
+				kv.readSnapshot(apply_msg.Snapshot)
+			} else {
+				op := apply_msg.Command.(Op)
+				kv.applyToStateMachine(op, apply_msg.CommandIndex)
+				kv.signalRPCHandler(apply_msg.CommandIndex, op)
+			}
+
+			kv.last_applied_idx = apply_msg.CommandIndex
 		}
 		kv.mu.Unlock()
 
