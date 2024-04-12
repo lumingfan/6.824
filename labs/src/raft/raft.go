@@ -326,7 +326,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	   rf.snapshot_len = args.Last_included_idx + 1
 	   rf.logs = rf.logs[last_included_idx_rel:] 
 
-	   DPrintf("After install snapshot from leader %d, snapshot len: %d, now logs is %v", args.Leader_id, rf.snapshot_len, rf.logs)
+	   DPrintf("After install snapshot from leader %d, snapshot len: %d, now server %d 's logs is %v", args.Leader_id, rf.snapshot_len, rf.me, rf.logs)
 
 	   rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Snapshot)
 	   return 
@@ -338,8 +338,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		Term:    args.Last_included_term,
 	})
 
+	DPrintf("After install snapshot from leader %d, snapshot len: %d, now server %d 's logs is %v", args.Leader_id, rf.snapshot_len, rf.me, rf.logs)
 
-	DPrintf("After install snapshot from leader %d, snapshot len: %d, now logs is %v", args.Leader_id, rf.snapshot_len, rf.logs)
 
 	rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Snapshot)
 	rf.apply_cv.Signal()
@@ -588,28 +588,28 @@ func (rf *Raft) startApplyLogsToStateMachine() {
 			return 
 		}
 
-		if rf.last_applied < rf.snapshot_len {
-			rf.last_applied = rf.snapshot_len - 1	
-			msg := ApplyMsg{
-				CommandValid: false,
-				Command:      nil,
-				CommandIndex: rf.last_applied,
-				Snapshot:     rf.persister.ReadSnapshot(),
-			}
-			rf.mu.Unlock()
-			rf.apply_ch <- msg	
-			rf.mu.Lock()
-		}
-
 		for rf.last_applied < rf.commit_index {
 			rf.last_applied++
 			last_applied_rel := rf.absIdxToRel(rf.last_applied)
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.logs[last_applied_rel].Command,
-				CommandIndex: rf.last_applied,
-				Snapshot: []byte{},
+
+			var msg ApplyMsg
+			if last_applied_rel <= 0 {
+				rf.last_applied = rf.snapshot_len - 1
+				msg = ApplyMsg{
+					CommandValid: false,
+					Command:      nil,
+					CommandIndex: rf.last_applied,
+					Snapshot:     rf.persister.ReadSnapshot(),
+				}
+			} else {
+				msg = ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[last_applied_rel].Command,
+					CommandIndex: rf.last_applied,
+					Snapshot: []byte{},
+				}
 			}
+
 			rf.mu.Unlock()
 			rf.apply_ch <- msg
 			rf.mu.Lock()
@@ -671,8 +671,8 @@ func (rf *Raft) encodeState() []byte{
 /** Check the validation of the snapshot 
  */
 func  (rf *Raft) checkValidSnapshot(idx int) bool {
-	// this snapshot has been applied to state machine
-	if idx <= rf.last_applied {
+	// this snapshot has been applied to state machine or already snapshot
+	if idx <= rf.last_applied || idx < rf.snapshot_len{
 		return false
 	}
 	return true
