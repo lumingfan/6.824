@@ -320,10 +320,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	last_included_idx_rel := rf.absIdxToRel(args.Last_included_idx)
 
+
 	if last_included_idx_rel < len(rf.logs) && 
 	   rf.logs[last_included_idx_rel].Term == args.Last_included_term {
 	   rf.snapshot_len = args.Last_included_idx + 1
 	   rf.logs = rf.logs[last_included_idx_rel:] 
+
+	   DPrintf("After install snapshot from leader %d, snapshot len: %d, now logs is %v", args.Leader_id, rf.snapshot_len, rf.logs)
+
 	   rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Snapshot)
 	   return 
 	}
@@ -333,6 +337,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		Command: nil,
 		Term:    args.Last_included_term,
 	})
+
+
+	DPrintf("After install snapshot from leader %d, snapshot len: %d, now logs is %v", args.Leader_id, rf.snapshot_len, rf.logs)
 
 	rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Snapshot)
 	rf.apply_cv.Signal()
@@ -426,6 +433,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		rf.match_index[rf.me] = index
 		DPrintf("leader %d add term: %d, command: %v", rf.me, rf.logs[len(rf.logs) - 1].Term, rf.logs[len(rf.logs) - 1].Command)
+
+		go rf.beginHeartbeats()
 	}
 
 	return index, term, isLeader
@@ -832,10 +841,13 @@ func (rf *Raft) fillConflictReply(args *AppendEntriesArgs, reply *AppendEntriesR
 /** update the server(follower)'s logs given the leader's logs  
  */
 func (rf *Raft) checkUpdateLogs(args *AppendEntriesArgs) {
+	debug_logs_discarded := false
+
 	logs_idx := rf.absIdxToRel(args.Prev_log_index + 1)
 	entries_idx := 0
 	for entries_idx < len(args.Entries) && logs_idx < len(rf.logs) {
 		if rf.logs[logs_idx] != args.Entries[entries_idx] {
+			debug_logs_discarded = true
 			rf.logs = rf.logs[:logs_idx]	
 			break	
 		}
@@ -843,6 +855,10 @@ func (rf *Raft) checkUpdateLogs(args *AppendEntriesArgs) {
 		entries_idx++
 	}
 	rf.logs = append(rf.logs, args.Entries[entries_idx:]...)
+
+	if debug_logs_discarded {
+		DPrintf("After receiving leader %d 's AppendEntries, now logs of %d is %v", args.Leader_id, rf.me, rf.logs)
+	}
 	rf.persist()
 }
 
@@ -875,6 +891,11 @@ func (rf *Raft) ReadStateSize() int {
 func (rf *Raft) SaveStateAndSnapshot(key_value map[string]string, seqnos map[int]int, last_snapshot_idx int) {
 	rf.mu.Lock()	
 	defer rf.mu.Unlock()
+	
+	// already snapshot, return
+	if last_snapshot_idx < rf.snapshot_len {
+		return
+	}
 
 	// save state and snapshot
 	buffer := new(bytes.Buffer)
@@ -888,6 +909,8 @@ func (rf *Raft) SaveStateAndSnapshot(key_value map[string]string, seqnos map[int
 	last_snapshot_idx_rel := rf.absIdxToRel(last_snapshot_idx)
 	rf.snapshot_len = last_snapshot_idx + 1	
 	rf.logs = rf.logs[last_snapshot_idx_rel:] 
+
+	DPrintf("After saving snapshot_len %d , server %d 's logs is: %v", rf.snapshot_len, rf.me, rf.logs)
 
 	rf.persister.SaveStateAndSnapshot(rf.encodeState(), buffer.Bytes())
 }
